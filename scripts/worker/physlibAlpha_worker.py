@@ -77,8 +77,10 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from collections.abc import Callable
@@ -547,6 +549,122 @@ def run_task(save: Path, task: Task, agent: Agent, started: str) -> tuple[AgentR
 ###################
 # This does safety checks on a PR to make sure it is valid.
 
+# The Lean program that finds the axioms of every declaration in the given modules. It is run with
+# `lake env lean --run`, after the modules are built, as
+#     lean --run AxiomCheck.lean <marker> <module> ...
+# and prints one line, `<marker> <json>`, where the JSON object lists each declaration that depends
+# on an axiom other than the three standard ones, `propext`, `Classical.choice` and `Quot.sound`.
+# A `sorry` or `admit` shows up as the axiom `sorryAx`, `native_decide` as an axiom it adds for its
+# compiled check (`<theorem>._native.native_decide.ax_1_1` in Lean 4.35), and a new `axiom` as
+# itself, so all of them are caught. It checks what Lean elaborated, not the text, so a `sorry` in
+# a comment or docstring is not counted, and a `sorry` produced by a macro or hidden in a helper
+# lemma is. The program lives here rather than in the clone, so the agent cannot edit it, and it
+# is parsed before the modules are loaded, so nothing they define can change how it runs.
+# The declarations of the checked modules are walked directly: the axiom tables in their .olean
+# files were made from the agent's code, so they are not used. Imported declarations (upstream
+# Physlib, Mathlib, Lean) use `collectAxioms`.
+AXIOM_CHECK_LEAN = r"""
+import Lean
+open Lean
+
+def moduleOf (env : Environment) (n : Name) : Name :=
+  match env.getModuleIdxFor? n with
+  | some idx => env.header.moduleNames[idx.toNat]!
+  | none => .anonymous
+
+/-- The constants an elaborated declaration refers to, proofs included. -/
+def usedExprs (env : Environment) : ConstantInfo → Array Expr
+  | .defnInfo v => #[v.type, v.value]
+  | .thmInfo v => #[v.type, v.value]
+  | .opaqueInfo v => #[v.type, v.value]
+  | .inductInfo v => #[v.type] ++ v.ctors.toArray.filterMap fun c => (env.find? c).map (·.type)
+  | ci => #[ci.type]
+
+/-- The axioms `n` depends on. `imported` caches the axioms of declarations outside `mods`. -/
+def axiomsOf (env : Environment) (mods : NameSet) (n : Name)
+    (imported : IO.Ref (Std.HashMap Name (Array Name))) : IO NameSet := do
+  let ctx : Core.Context := { fileName := "<axiom-check>", fileMap := default }
+  let mut seen : NameSet := {}
+  let mut todo : Array Name := #[n]
+  let mut axs : NameSet := {}
+  while h : todo.size > 0 do
+    let c := todo[todo.size - 1]
+    todo := todo.pop
+    if seen.contains c then continue
+    seen := seen.insert c
+    unless mods.contains (moduleOf env c) do
+      let as ← match (← imported.get)[c]? with
+        | some as => pure as
+        | none => do
+          let (as, _) ← (collectAxioms c : CoreM _).toIO ctx { env }
+          imported.modify (·.insert c as)
+          pure as
+      for a in as do axs := axs.insert a
+      continue
+    let some ci := env.find? c | throw <| IO.userError s!"unknown constant {c}"
+    if let .axiomInfo _ := ci then axs := axs.insert c
+    for e in usedExprs env ci do
+      for d in e.getUsedConstants do
+        unless seen.contains d do todo := todo.push d
+  return axs
+
+unsafe def main (args : List String) : IO UInt32 := do
+  let marker :: modules := args | throw <| IO.userError "usage: AxiomCheck.lean <marker> <module> ..."
+  let modules := modules.toArray.map String.toName
+  let standard : NameSet := [``propext, ``Classical.choice, ``Quot.sound].foldl (·.insert ·) {}
+  initSearchPath (← findSysroot)
+  -- `initialize` blocks of the modules are not run (no `enableInitializersExecution`).
+  let env ← importModules (modules.map ({ module := · })) {} (level := .private)
+  let mods : NameSet := modules.foldl (·.insert ·) {}
+  let imported ← IO.mkRef {}
+  let mut checked : Nat := 0
+  let mut bad : Array Json := #[]
+  for m in modules do
+    let some idx := env.getModuleIdx? m | throw <| IO.userError s!"module {m} not found"
+    for n in env.header.moduleData[idx.toNat]!.constNames do
+      checked := checked + 1
+      let extra := (← axiomsOf env mods n imported).toArray.filter (!standard.contains ·)
+      unless extra.isEmpty do
+        bad := bad.push <| Json.mkObj [("name", toString n),
+          ("axioms", toJson ((extra.qsort Name.lt).map toString))]
+  IO.println s!"{marker} {Json.compress (Json.mkObj [("checked", toJson checked), ("bad", Json.arr bad)])}"
+  return 0
+"""
+
+
+def module_name(path: str) -> str:
+    """The Lean module of a file, e.g. `PhyslibAlpha.Foo.Bar` for `PhyslibAlpha/Foo/Bar.lean`."""
+    return path.removesuffix(".lean").replace("/", ".")
+
+
+def axiom_check(clone: Path, modules: list[str]) -> list[tuple[str, list[str]]]:
+    """The declarations in the built `modules` that depend on sorry or a non-standard axiom, each
+    with those axioms. Compiler-generated helpers (e.g. `foo._proof_1`) are listed only when no
+    declaration of the user's own does."""
+    if not modules:
+        return []
+    marker = f"axiom-check-{secrets.token_hex(8)}"
+    with tempfile.TemporaryDirectory() as folder:
+        program = Path(folder) / "AxiomCheck.lean"
+        program.write_text(AXIOM_CHECK_LEAN)
+        result = run(["lake", "env", "lean", "--run", str(program), marker, *modules],
+                     cwd=clone, capture=True, check=False)
+    report = next((line.removeprefix(marker + " ") for line in result.stdout.splitlines()
+                   if line.startswith(marker + " ")), None)
+    if result.returncode != 0 or report is None:
+        detail = (result.stderr or result.stdout or "").strip()[-2000:]
+        raise WorkerError(f"the axiom check did not run (exit {result.returncode}):\n{detail}")
+    bad = [(d["name"], d["axioms"]) for d in json.loads(report)["bad"]]
+    own = [(name, axioms) for name, axioms in bad if not _internal(name)]
+    return own or bad
+
+
+def _internal(name: str) -> bool:
+    """Whether a declaration name is one Lean made (a part starting with `_`, e.g. `_proof_1`);
+    a `private` declaration, `_private.<module>.0.<name>`, is not one."""
+    return any(part.startswith("_") for part in name.removeprefix("_private.").split("."))
+
+
 def safety_checks(clone: Path, branch: str) -> None:
     """Check the agent's change without relying on what it reports; raise WorkerError if it fails.
 
@@ -566,7 +684,7 @@ def safety_checks(clone: Path, branch: str) -> None:
     diff = output(["git", "diff", "--name-status", "--no-renames", upstream], cwd=clone)
     new = output(["git", "ls-files", "--others", "--exclude-standard"], cwd=clone)
     changed = [line.split("\t", 1) for line in diff.splitlines()] + [["A", path] for path in new.splitlines()]
-    escape_hatches = re.compile(r"\b(sorry|admit|axiom|native_decide)\b")
+    lean_files = []
     for status, path in changed:
         # Only files in PhyslibAlpha/ and PhyslibAlpha.lean changed, and none was deleted.
         if status == "D":
@@ -574,19 +692,23 @@ def safety_checks(clone: Path, branch: str) -> None:
             continue
         if not (path.startswith(f"{LIBRARY}/") or path == f"{LIBRARY}.lean"):
             problems.append(f"changed a file outside {LIBRARY}: {path}")
-        # No sorry, admit, axiom or native_decide was added.
-        if path.endswith(".lean") and (clone / path).is_file():
-            before = run(["git", "show", f"{upstream}:{path}"], cwd=clone, capture=True, check=False, quiet=True)
-            added = len(escape_hatches.findall((clone / path).read_text())) - len(
-                escape_hatches.findall(before.stdout if before.returncode == 0 else "")
-            )
-            if added > 0:
-                problems.append(f"{path}: {added} new use(s) of sorry, admit, axiom or native_decide")
+        elif path.endswith(".lean"):
+            lean_files.append(path)
     if problems:
         raise WorkerError("the change failed its checks:\n" + "\n".join(problems))
-    # PhyslibAlpha builds, and the PhyslibAlpha linters that AGENTS.md lists pass
+    # PhyslibAlpha builds, and so does every changed file, even one PhyslibAlpha.lean does not
+    # import yet (`alphaFileImports` below catches that).
+    modules = [module_name(path) for path in lean_files]
+    run(["lake", "build", LIBRARY, *modules], cwd=clone)
+    # No declaration in a changed file depends on sorry, or on an axiom other than the three
+    # standard ones (this catches sorry, admit, a new axiom and native_decide).
+    if bad := axiom_check(clone, modules):
+        raise WorkerError(
+            "the change failed its checks:\n"
+            + "\n".join(f"{name} depends on {', '.join(axioms)}" for name, axioms in bad)
+        )
+    # The PhyslibAlpha linters that AGENTS.md lists pass
     # (`alphaFileImports` also checks that PhyslibAlpha.lean imports any new file).
-    run(["lake", "build", LIBRARY], cwd=clone)
     for linter in [
         ["lake", "exe", "module_doc_lint"],
         ["./scripts/lint/required/alpha/alphaPythonLinters.sh"],

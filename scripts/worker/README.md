@@ -18,7 +18,7 @@ flowchart TD
     task["8. Read the task from physlibAlpha_worker.toml<br>and .agents/skills/(task)/SKILL.md"]
     runTask["9. The agent runs the task in the clone"]
     changed{"Anything changed?"}
-    checks["10. Safety checks<br>only PhyslibAlpha changed, nothing deleted,<br>no new sorry, admit, axiom or native_decide,<br>PhyslibAlpha builds, linters pass"]
+    checks["10. Safety checks<br>only PhyslibAlpha changed, nothing deleted,<br>PhyslibAlpha builds,<br>no changed declaration depends on sorry or a<br>non-standard axiom (checked in Lean), linters pass"]
     pr["11. Commit, push and open a PR on upstream"]
     report["12. Do handbook alignment report and post on PR"]
     clean["13. Delete the branch and print a summary"]
