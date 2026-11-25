@@ -566,7 +566,7 @@ def safety_checks(clone: Path, branch: str) -> None:
     diff = output(["git", "diff", "--name-status", "--no-renames", upstream], cwd=clone)
     new = output(["git", "ls-files", "--others", "--exclude-standard"], cwd=clone)
     changed = [line.split("\t", 1) for line in diff.splitlines()] + [["A", path] for path in new.splitlines()]
-    escape_hatches = re.compile(r"\b(sorry|admit|axiom|native_decide)\b")
+    modules = []
     for status, path in changed:
         # Only files in PhyslibAlpha/ and PhyslibAlpha.lean changed, and none was deleted.
         if status == "D":
@@ -574,19 +574,22 @@ def safety_checks(clone: Path, branch: str) -> None:
             continue
         if not (path.startswith(f"{LIBRARY}/") or path == f"{LIBRARY}.lean"):
             problems.append(f"changed a file outside {LIBRARY}: {path}")
-        # No sorry, admit, axiom or native_decide was added.
         if path.endswith(".lean") and (clone / path).is_file():
-            before = run(["git", "show", f"{upstream}:{path}"], cwd=clone, capture=True, check=False, quiet=True)
-            added = len(escape_hatches.findall((clone / path).read_text())) - len(
-                escape_hatches.findall(before.stdout if before.returncode == 0 else "")
-            )
-            if added > 0:
-                problems.append(f"{path}: {added} new use(s) of sorry, admit, axiom or native_decide")
+            modules.append(path.removesuffix(".lean").replace("/", "."))
     if problems:
         raise WorkerError("the change failed its checks:\n" + "\n".join(problems))
     # PhyslibAlpha builds, and the PhyslibAlpha linters that AGENTS.md lists pass
     # (`alphaFileImports` also checks that PhyslibAlpha.lean imports any new file).
     run(["lake", "build", LIBRARY], cwd=clone)
+    # No sorry, admit, axiom or native_decide in the changed modules. This reads the built
+    # declarations rather than the source text, so comments and strings cannot hide or fake one,
+    # and a sorry moved into a helper lemma or a `have` is still found.
+    if modules:
+        check = run(["lake", "env", "lean", "--run", "scripts/worker/AxiomCheck.lean", *modules],
+                    cwd=clone, capture=True, check=False)
+        if check.returncode != 0:
+            raise WorkerError("the change uses an escape hatch (sorry, admit, axiom or native_decide):\n"
+                              + (check.stdout + check.stderr).strip())
     for linter in [
         ["lake", "exe", "module_doc_lint"],
         ["./scripts/lint/required/alpha/alphaPythonLinters.sh"],
