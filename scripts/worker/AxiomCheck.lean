@@ -52,6 +52,9 @@ def main (args : List String) : IO UInt32 := do
     IO.eprintln "usage: lean --run AxiomCheck.lean <Module> ..."
     return 2
   let mods := args.map String.toName
+  if let some bad := args.find? fun a => a.toName.isAnonymous || a.any Char.isWhitespace then
+    IO.eprintln s!"not a module name: {repr bad} (pass one module per argument)"
+    return 2
   initSearchPath (← findSysroot)
   -- Only declarations are read, so environment extensions (and their initializers) are not loaded.
   let env ← importModules (mods.toArray.map fun m => { module := m }) {}
